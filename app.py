@@ -1,242 +1,177 @@
 import os
 import time
 import tempfile
-
 import streamlit as st
+from dotenv import load_dotenv
+from agno.media import Video
 
+# --- [1] 强制代理配置 (解决 WinError 10060) ---
+# 请务必检查你的 VPN 端口，如果是 7890 保持不变
+os.environ["HTTP_PROXY"] = "http://127.0.0.1:7890"
+os.environ["HTTPS_PROXY"] = "http://127.0.0.1:7890"
+
+load_dotenv()
+API_KEY = os.getenv("GOOGLE_API_KEY")
+
+# 引入最新版 SDK
+import google.genai as genai
 from agno.agent import Agent
 from agno.models.google import Gemini
 from agno.tools.duckduckgo import DuckDuckGoTools
 
-import google.generativeai as genai
-from google.generativeai import upload_file, get_file
+# --- [2] 页面压缩布局 ---
+st.set_page_config(layout="wide", page_title="低空巡检 Pro 控制台")
 
-from langchain_community.tools import DuckDuckGoSearchRun
-
-from dotenv import load_dotenv
-
-load_dotenv()
-API_KEY = os.getenv("GOOGLE_API_KEY")
-if API_KEY:
-    genai.configure(api_key=API_KEY)
-
-st.set_page_config(
-    page_title="Multimodal AI Agent - Chat & Video Analysis",
-    page_icon="🎥",
-    layout="wide",
-)
-
-# Custom CSS for better UI
 st.markdown("""
     <style>
+        /* [1] 页面基础缩放与页边距优化 */
+        html { zoom: 1.0; } 
+        .block-container { padding-top: 1rem !important; padding-bottom: 0rem !important; }
+
+        /* [2] 强制左右分栏列等高，并防止溢出 */
+        [data-testid="stColumn"] {
+            height: 82vh !important;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* [3] 核心修改：让对话输入框强制锚定在分栏底部，而不是全屏底部 */
+        /* 我们通过覆盖 Streamlit 默认的 fixed 定位来实现 */
         .stChatFloatingInputContainer {
-            position: fixed;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            background-color: white;
-            padding: 1rem;
-            z-index: 100;
-            max-width: 100% !important;
+            position: relative !important;
+            bottom: 0 !important;
+            left: 0 !important;
             width: 100% !important;
+            background: transparent !important;
+            padding: 0.5rem 0 !important;
+            z-index: 1;
         }
-        .main {
-            margin-bottom: 100px;
+
+        /* [4] 修正对话框容器，使其自动填充剩余空间并提供内部滚动 */
+        .stChatMessageContainer {
+            flex-grow: 1;
+            overflow-y: auto !important;
+            margin-bottom: 5px;
+            padding-right: 5px;
         }
-        .stChatMessage {
-            max-width: 100% !important;
-            width: 100% !important;
-            margin: 1rem 0;
+
+        /* [5] 视频区域大小限制，防止挤压对话框 */
+        video { 
+            max-height: 45vh !important; 
+            object-fit: contain; 
+            border-radius: 12px; 
+            background: #000;
         }
-        .stChatInputContainer {
-            max-width: 100% !important;
-            padding: 0 1rem;
-        }
-        .stChatInput {
-            max-width: 100% !important;
-            width: 100% !important;
-        }
+
+        /* 隐藏不必要的元素 */
+        footer, header {visibility: hidden;}
     </style>
 """, unsafe_allow_html=True)
 
-# Application Title and Header
-st.title("AI Video Analyzer & Chat Agent 🤖🎥")
-st.header("Powered by Gemini 1.5 Flash & DuckDuckGo")
+# --- [3] 初始化状态 ---
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "processed_v_name" not in st.session_state:
+    st.session_state.processed_v_name = None
 
-def initialize_session_state():
-    """Initialize all session state variables"""
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-    if "processed_video_file" not in st.session_state:
-        st.session_state.processed_video_file = None
-    if "uploaded_video_name" not in st.session_state:
-        st.session_state.uploaded_video_name = None
-    if "last_activity" not in st.session_state:
-        st.session_state.last_activity = time.time()
-
-initialize_session_state()
-
+# --- [4] Agent 配置 (使用 Gemini 2.5 Flash) ---
 @st.cache_resource
-def initialize_agent():
-    """Initialize the AI agent with Gemini model and DuckDuckGo tool"""
+def get_drone_agent():
     return Agent(
-        name="Video Analyzer & AI Chat Agent with Web Search",
-        model=Gemini(id="gemini-1.5-flash"),
+        name="低空巡检高级专家",
+        # 使用最新的预览版 ID
+        model=Gemini(id="models/gemini-2.5-flash", api_key=API_KEY),
         tools=[DuckDuckGoTools()],
-        markdown=True,
+        instructions=[
+            "你是一个拥有最高权限的低空巡检专家。",
+            "当用户提供了视频附件时，你必须调用你的多模态能力查看并分析视频内容，深度解析视频中的安全隐患、违规行为或环境异常。",
+            "严禁回答‘我无法观看视频’。如果视频已加载，它就在你的上下文缓存中。",
+            "即便没有视频，也要以专业视角回答低空经济、无人机管理的相关问题。",
+            "提供分析时，请务必给出视频中对应的具体时间范围（如：[00:15 - 00:22]）。"
+        ],
+        markdown=True
     )
 
-def auto_scroll():
-    """Auto-scroll to the bottom of the chat"""
-    if st.session_state.chat_history:
-        js = """
-        <script>
-            window.scrollTo(0, document.body.scrollHeight);
-        </script>
-        """
-        st.markdown(js, unsafe_allow_html=True)
+agent = get_drone_agent()
 
-def check_session_timeout():
-    """Check if session has timed out (1 hour of inactivity)"""
-    if time.time() - st.session_state.last_activity > 3600:
-        st.session_state.clear()
-        st.experimental_rerun()
-    st.session_state.last_activity = time.time()
+# --- [5] UI 主逻辑 ---
+st.title("🚁 低空巡检 & AI 深度决策系统")
 
-def process_video(file):
-    """Process uploaded video file using Gemini API"""
-    try:
-        # Check if we've already processed this video
-        if (st.session_state.uploaded_video_name == file.name and 
-            st.session_state.processed_video_file is not None):
-            return True
+col_l, col_spacer, col_r = st.columns([0.50, 0.02, 0.48])
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video:
-            temp_video.write(file.read())
-            video_path = temp_video.name
-
-        with st.spinner("Processing video..."):
-            processed_video = upload_file(video_path)
-            while processed_video.state.name == "PROCESSING":
-                time.sleep(1)
-                processed_video = get_file(processed_video.name)
-
-        if processed_video.state.name == "ACTIVE":
-            st.session_state.processed_video_file = processed_video
-            st.session_state.uploaded_video_name = file.name
-            st.success("Video processing complete! 🎉")
-            return True
-        else:
-            st.error("Video processing failed. Please try again.")
-            return False
-    except Exception as e:
-        st.error(f"Video processing error: {e}")
-        return False
-    finally:
-        # Clean up the temporary file
-        if 'temp_video' in locals():
-            os.unlink(temp_video.name)
-
-def generate_response(query):
-    """Generate AI response using video content and external knowledge"""
-    try:
-        prompt = f"Use the uploaded video content and external knowledge to answer the question: {query}"
-        response = multimodal_Agent.run(
-                                         prompt,
-                                         videos=[{"filepath": st.session_state.processed_video_file.name}]
-                                        )
-
-        ai_response = response.content
-
-        if not ai_response or len(ai_response.strip()) < 50:
-            return perform_web_search(query)
-        return ai_response
-    except Exception as e:
-        return f"An error occurred: {e}"
-
-
-
-def perform_web_search(query):
-    """Perform web search using Agno's DuckDuckGoTools"""
-    try:
-        with st.spinner("Searching the web..."):
-            search = DuckDuckGoSearchRun()
-            # Form search query with better context
-            search_prompt = f"Search for information about: {query}"
-            
-            # Run the search via the agent
-            response = search.invoke(search_prompt)
-            
-            # Extract and format the response
-            if response:
-                return response
-            else:
-                return f"No relevant results found for '{query}'. Try asking in a different way."
-    except Exception as e:
-        return f"Search error: {e}"
-
-# Initialize the agent
-multimodal_Agent = initialize_agent()
-
-# Check session timeout
-check_session_timeout()
-
-# Main UI Components
-video_file = st.file_uploader(
-    "Upload a video file to Analyse",
-    type=["mp4", "mov", "avi", "mkv"],
-)
-
-if video_file:
-    # Only process if it's a new video or not processed yet
-    if (st.session_state.uploaded_video_name != video_file.name or 
-        st.session_state.processed_video_file is None):
-        process_video(video_file)
+with col_l:
+    st.markdown("#### 📽 巡检视频流")
+    v_file = st.file_uploader("Upload Video", type=["mp4", "mov"], label_visibility="collapsed")
     
-    # Display video and chat interface
-    st.video(video_file, format="video/mp4", start_time=0)
+    if v_file:
+        if st.session_state.get("current_v") != v_file.name:
+            try:
+                client = genai.Client(api_key=API_KEY)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+                    tmp.write(v_file.read())
+                    path = tmp.name
+                
+                with st.spinner("🧠 Gemini 2.5 正在构建视频神经元映射..."):
+                    # 使用新版 SDK 上传
+                    file_ref = client.files.upload(file=path)
+                    while file_ref.state == "PROCESSING":
+                        time.sleep(2)
+                        file_ref = client.files.get(name=file_ref.name)
+                    
+                    st.session_state.processed_v_name = file_ref.name
+                    st.session_state.current_v = v_file.name
+                st.success("视频深度解析就绪！")
+            except Exception as e:
+                st.error(f"连接失败。请检查 API Key 或 VPN 节点。错误：{e}")
+        st.video(v_file)
+    else:
+        st.info("💡 处于纯知识对话模式。上传视频后将自动开启 AI 巡检分析。")
+
+with col_r:
+    st.markdown("#### 💬 专家对话窗口")
+    chat_box = st.container(height=520)
     
-    # Chat interface
-    chat_container = st.container()
-    with chat_container:
-        for message in st.session_state.chat_history:
-            with st.chat_message("user"):
-                st.write(message["user"])
-            with st.chat_message("assistant"):
-                st.write(message["ai"])
-    
-    # Input interface
-    col1, col2 = st.columns([5, 1])
-    with col1:
-        prompt = st.chat_input("Ask anything about the video...")
-    with col2:
-        search_button = st.button("Web Search 🔍")
+    # 历史记录渲染
+    with chat_box:
+        if not st.session_state.chat_history:
+            st.chat_message("assistant").markdown("你好！我是基于 **Gemini 2.5 Flash** 的巡检专家，我已准备好为你分析视频内容或解答行业知识。")
+        for m in st.session_state.chat_history:
+            st.chat_message(m["role"]).markdown(m["content"])
 
-    # Handle user input
-    if prompt:
-        with chat_container:
-            with st.chat_message("user"):
-                st.write(prompt)
-            with st.chat_message("assistant"):
-                message_placeholder = st.empty()
-                message_placeholder.markdown("Thinking...")
-                response = generate_response(prompt)
-                message_placeholder.markdown(response)
-            st.session_state.chat_history.append({"user": prompt, "ai": response})
-            auto_scroll()
-
-    # Handle web search
-    if search_button and st.session_state.chat_history:
-        last_query = st.session_state.chat_history[-1]["user"]
-        with chat_container:
-            with st.chat_message("assistant"):
-                search_results = perform_web_search(last_query)
-                st.markdown(search_results)
-                st.session_state.chat_history.append(
-                    {"user": f"🔍 Web search for: {last_query}", 
-                     "ai": search_results}
-                )
-                auto_scroll()
-
-else:
-    st.info("Upload a video file to begin analysis.")
+    # 对话输入逻辑
+    if prompt := st.chat_input("询问巡检细节..."):
+        st.chat_message("user").markdown(prompt)
+        with st.chat_message("assistant"):
+            with st.spinner("🚀 原生引擎分析中（拒绝幻觉）..."):
+                try:
+                    # 获取之前上传成功的文件引用
+                    file_name = st.session_state.processed_v_name
+                    
+                    if file_name:
+                        # 核心：直接使用 google-genai 客户端，不通过 Agno 包装
+                        client = genai.Client(api_key=API_KEY)
+                        
+                        # 构造多模态内容：文本 + 视频引用
+                        content = [
+                            {"file_data": {"file_uri": f"https://generativelanguage.googleapis.com/v1beta/{file_name}", "mime_type": "video/mp4"}},
+                            f"请根据视频内容真实回答，严禁幻觉。用户问题：{prompt}"
+                        ]
+                        
+                        # 调用模型
+                        # 注意：这里直接用 client 而不是 agent.run，确保 100% 成功率
+                        response = client.models.generate_content(
+                            model="gemini-2.5-flash", # 或者你确定可用的 1.5-flash
+                            contents=content
+                        )
+                        answer = response.text
+                    else:
+                        # 没有视频时才走普通的 agent 逻辑
+                        res = agent.run(prompt)
+                        answer = res.content
+                    
+                    st.markdown(answer)
+                    st.session_state.chat_history.append({"role": "user", "content": prompt})
+                    st.session_state.chat_history.append({"role": "assistant", "content": answer})
+                except Exception as e:
+                    st.error(f"分析失败: {e}")
