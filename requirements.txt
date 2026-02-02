@@ -3,6 +3,5 @@ agno
 langchain
 langchain-community
 google-genai
-google-generativeai
 duckduckgo-search
 python-dotenv
