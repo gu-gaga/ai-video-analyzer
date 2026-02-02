@@ -72,7 +72,6 @@ ai-video-analyzer
 - Python 3.7 or higher
 - pip (Python package manager)
 - Google AI Studio API key
-- Agno API key
 
 ### Installation
 
@@ -104,19 +103,17 @@ ai-video-analyzer
 4. Set up environment variables:
 
    ```sh
-   cp .env.example .env
+   cp .env .env
    ```
 
 5. Edit the `.env` file and add your API keys:
 
    ```sh
    GOOGLE_API_KEY="your_google_api_key_here"
-   AGNO_API_KEY="your_agno_api_key_here"
    ```
 
    - You'll need to:
      - Get a Google API key from [Google AI Studio](https://aistudio.google.com/)
-     - Get an Agno API key from [Agno](https://app.agno.com/)
 
 ## Usage
 
