@@ -1,177 +1,223 @@
 import os
 import time
 import tempfile
-import streamlit as st
+from flask import Flask, render_template, request, jsonify, send_from_directory
+from flask_cors import CORS
 from dotenv import load_dotenv
-from agno.media import Video
-
-# --- [1] 强制代理配置 (解决 WinError 10060) ---
-# 请务必检查你的 VPN 端口，如果是 7890 保持不变
-os.environ["HTTP_PROXY"] = "http://127.0.0.1:7890"
-os.environ["HTTPS_PROXY"] = "http://127.0.0.1:7890"
-
-load_dotenv()
-API_KEY = os.getenv("GOOGLE_API_KEY")
-
-# 引入最新版 SDK
 import google.genai as genai
 from agno.agent import Agent
 from agno.models.google import Gemini
-from agno.tools.duckduckgo import DuckDuckGoTools
+from agno.tools.mcp import MCPTools
 
-# --- [2] 页面压缩布局 ---
-st.set_page_config(layout="wide", page_title="低空巡检 Pro 控制台")
+# --- [1] 环境与代理配置 ---
+load_dotenv()
 
-st.markdown("""
-    <style>
-        /* [1] 页面基础缩放与页边距优化 */
-        html { zoom: 1.0; } 
-        .block-container { padding-top: 1rem !important; padding-bottom: 0rem !important; }
+# 从环境变量读取代理配置（如果存在）
+http_proxy = os.getenv("HTTP_PROXY", "")
+https_proxy = os.getenv("HTTPS_PROXY", "")
+if http_proxy:
+    os.environ["HTTP_PROXY"] = http_proxy
+if https_proxy:
+    os.environ["HTTPS_PROXY"] = https_proxy
 
-        /* [2] 强制左右分栏列等高，并防止溢出 */
-        [data-testid="stColumn"] {
-            height: 82vh !important;
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-        }
+API_KEY = os.getenv("GOOGLE_API_KEY")
+if not API_KEY:
+    print("❌ 未找到 GOOGLE_API_KEY 环境变量，请在 .env 文件中配置")
+    exit(1)
 
-        /* [3] 核心修改：让对话输入框强制锚定在分栏底部，而不是全屏底部 */
-        /* 我们通过覆盖 Streamlit 默认的 fixed 定位来实现 */
-        .stChatFloatingInputContainer {
-            position: relative !important;
-            bottom: 0 !important;
-            left: 0 !important;
-            width: 100% !important;
-            background: transparent !important;
-            padding: 0.5rem 0 !important;
-            z-index: 1;
-        }
+# --- [2] Flask 应用初始化 ---
+app = Flask(__name__)
+CORS(app)
 
-        /* [4] 修正对话框容器，使其自动填充剩余空间并提供内部滚动 */
-        .stChatMessageContainer {
-            flex-grow: 1;
-            overflow-y: auto !important;
-            margin-bottom: 5px;
-            padding-right: 5px;
-        }
+# 全局变量存储视频文件ID和聊天历史
+video_file_id = None
+chat_history = []
 
-        /* [5] 视频区域大小限制，防止挤压对话框 */
-        video { 
-            max-height: 45vh !important; 
-            object-fit: contain; 
-            border-radius: 12px; 
-            background: #000;
-        }
+# --- [3] 工具函数定义 ---
+def analyze_drone_video(query: str) -> str:
+    """分析无人机巡检视频内容"""
+    global video_file_id
+    if not video_file_id:
+        return "提示：当前系统中未发现挂载的视频，请告知用户先上传视频。"
 
-        /* 隐藏不必要的元素 */
-        footer, header {visibility: hidden;}
-    </style>
-""", unsafe_allow_html=True)
+    try:
+        client = genai.Client(api_key=API_KEY)
+        content = [
+            {"file_data": {"file_uri": f"https://generativelanguage.googleapis.com/v1beta/{video_file_id}",
+                           "mime_type": "video/mp4"}},
+            f"作为巡检视觉专家，请针对该视频回答以下问题：{query}"
+        ]
+        response = client.models.generate_content(model="gemini-2.5-flash", contents=content)
+        return response.text
+    except Exception as e:
+        return f"视觉分析执行出错: {str(e)}"
 
-# --- [3] 初始化状态 ---
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "processed_v_name" not in st.session_state:
-    st.session_state.processed_v_name = None
+def web_search(query: str) -> str:
+    """联网搜索最新信息"""
+    try:
+        from duckduckgo_search import DDGS
 
-# --- [4] Agent 配置 (使用 Gemini 2.5 Flash) ---
-@st.cache_resource
+        # 使用 DuckDuckGo 搜索
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=5))
+
+            if not results:
+                return "未找到相关搜索结果"
+
+            # 格式化搜索结果
+            formatted_results = "🔍 搜索结果：\n\n"
+            for i, result in enumerate(results, 1):
+                formatted_results += f"{i}. **{result['title']}**\n"
+                formatted_results += f"   {result['body']}\n"
+                formatted_results += f"   来源: {result['href']}\n\n"
+
+            return formatted_results
+    except Exception as e:
+        return f"搜索出错: {str(e)}"
+
+# --- [4] Agent 初始化 ---
 def get_drone_agent():
+    tools_list = [
+        analyze_drone_video,
+        web_search,  # 添加联网搜索工具
+        MCPTools(command="npx -y @modelcontextprotocol/server-duckduckgo"),
+        MCPTools(command="npx -y @modelcontextprotocol/server-weather")
+    ]
+
     return Agent(
-        name="低空巡检高级专家",
-        # 使用最新的预览版 ID
+        name="智能分析助手",
         model=Gemini(id="models/gemini-2.5-flash", api_key=API_KEY),
-        tools=[DuckDuckGoTools()],
+        tools=tools_list,
         instructions=[
-            "你是一个拥有最高权限的低空巡检专家。",
-            "当用户提供了视频附件时，你必须调用你的多模态能力查看并分析视频内容，深度解析视频中的安全隐患、违规行为或环境异常。",
-            "严禁回答‘我无法观看视频’。如果视频已加载，它就在你的上下文缓存中。",
-            "即便没有视频，也要以专业视角回答低空经济、无人机管理的相关问题。",
-            "提供分析时，请务必给出视频中对应的具体时间范围（如：[00:15 - 00:22]）。"
+            "你是一个智能分析助手，具备多模态分析和信息检索能力。",
+            "",
+            "**核心能力：**",
+            "1. 视频分析：当用户上传视频后，可以调用 analyze_drone_video 工具分析视频内容",
+            "2. 实时搜索：使用 web_search 工具搜索最新法规、新闻、政策等实时信息",
+            "3. 天气查询：使用 weather server 查询天气信息",
+            "4. 网络搜索：使用 search server 进行其他网络搜索",
+            "",
+            "**特色领域：**",
+            "- 擅长低空巡检、无人机监测、空域管理等专业领域",
+            "- 熟悉航空法规、安全规范、应急处置等知识",
+            "- 能够结合视频内容提供专业的巡检建议和风险评估",
+            "",
+            "**工作原则：**",
+            "1. 灵活应对：不局限于巡检场景，可以回答各类问题",
+            "2. 工具优先：遇到需要实时信息或视频分析的问题，主动调用相应工具",
+            "3. 专业建议：在巡检、监测等专业领域，提供深度分析和决策建议",
+            "4. 清晰表达：使用 **粗体** 标记重点，用 * 列出要点，保持回复结构清晰",
+            "",
+            "记住：你是一个全能助手，巡检只是你的专长之一，而非全部。"
         ],
         markdown=True
     )
 
 agent = get_drone_agent()
 
-# --- [5] UI 主逻辑 ---
-st.title("🚁 低空巡检 & AI 深度决策系统")
+# --- [5] 路由定义 ---
+@app.route('/')
+def index():
+    """返回主页面"""
+    return render_template('index.html')
 
-col_l, col_spacer, col_r = st.columns([0.50, 0.02, 0.48])
+@app.route('/api/upload-video', methods=['POST'])
+def upload_video():
+    """处理视频上传"""
+    global video_file_id
 
-with col_l:
-    st.markdown("#### 📽 巡检视频流")
-    v_file = st.file_uploader("Upload Video", type=["mp4", "mov"], label_visibility="collapsed")
-    
-    if v_file:
-        if st.session_state.get("current_v") != v_file.name:
+    if 'video' not in request.files:
+        return jsonify({'error': '没有上传文件'}), 400
+
+    video = request.files['video']
+    if video.filename == '':
+        return jsonify({'error': '文件名为空'}), 400
+
+    temp_path = None
+    try:
+        # 保存临时文件
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            video.save(tmp.name)
+            temp_path = tmp.name
+
+        # 上传到 Gemini API
+        client = genai.Client(api_key=API_KEY)
+        file_ref = client.files.upload(file=temp_path)
+
+        # 等待处理完成（最多5分钟）
+        max_wait_time = 300
+        start_time = time.time()
+
+        while file_ref.state == "PROCESSING":
+            if time.time() - start_time > max_wait_time:
+                return jsonify({'error': '视频处理超时'}), 408
+            time.sleep(2)
+            file_ref = client.files.get(name=file_ref.name)
+
+        if file_ref.state == "FAILED":
+            return jsonify({'error': '视频处理失败'}), 500
+
+        video_file_id = file_ref.name
+        return jsonify({
+            'success': True,
+            'message': '视频上传成功',
+            'file_id': video_file_id
+        })
+
+    except Exception as e:
+        return jsonify({'error': f'上传失败: {str(e)}'}), 500
+
+    finally:
+        # 清理临时文件
+        if temp_path and os.path.exists(temp_path):
             try:
-                client = genai.Client(api_key=API_KEY)
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-                    tmp.write(v_file.read())
-                    path = tmp.name
-                
-                with st.spinner("🧠 Gemini 2.5 正在构建视频神经元映射..."):
-                    # 使用新版 SDK 上传
-                    file_ref = client.files.upload(file=path)
-                    while file_ref.state == "PROCESSING":
-                        time.sleep(2)
-                        file_ref = client.files.get(name=file_ref.name)
-                    
-                    st.session_state.processed_v_name = file_ref.name
-                    st.session_state.current_v = v_file.name
-                st.success("视频深度解析就绪！")
-            except Exception as e:
-                st.error(f"连接失败。请检查 API Key 或 VPN 节点。错误：{e}")
-        st.video(v_file)
-    else:
-        st.info("💡 处于纯知识对话模式。上传视频后将自动开启 AI 巡检分析。")
+                os.unlink(temp_path)
+            except Exception:
+                pass
 
-with col_r:
-    st.markdown("#### 💬 专家对话窗口")
-    chat_box = st.container(height=520)
-    
-    # 历史记录渲染
-    with chat_box:
-        if not st.session_state.chat_history:
-            st.chat_message("assistant").markdown("你好！我是基于 **Gemini 2.5 Flash** 的巡检专家，我已准备好为你分析视频内容或解答行业知识。")
-        for m in st.session_state.chat_history:
-            st.chat_message(m["role"]).markdown(m["content"])
+@app.route('/api/chat', methods=['POST'])
+def chat():
+    """处理聊天消息"""
+    global chat_history
 
-    # 对话输入逻辑
-    if prompt := st.chat_input("询问巡检细节..."):
-        st.chat_message("user").markdown(prompt)
-        with st.chat_message("assistant"):
-            with st.spinner("🚀 原生引擎分析中（拒绝幻觉）..."):
-                try:
-                    # 获取之前上传成功的文件引用
-                    file_name = st.session_state.processed_v_name
-                    
-                    if file_name:
-                        # 核心：直接使用 google-genai 客户端，不通过 Agno 包装
-                        client = genai.Client(api_key=API_KEY)
-                        
-                        # 构造多模态内容：文本 + 视频引用
-                        content = [
-                            {"file_data": {"file_uri": f"https://generativelanguage.googleapis.com/v1beta/{file_name}", "mime_type": "video/mp4"}},
-                            f"请根据视频内容真实回答，严禁幻觉。用户问题：{prompt}"
-                        ]
-                        
-                        # 调用模型
-                        # 注意：这里直接用 client 而不是 agent.run，确保 100% 成功率
-                        response = client.models.generate_content(
-                            model="gemini-2.5-flash", # 或者你确定可用的 1.5-flash
-                            contents=content
-                        )
-                        answer = response.text
-                    else:
-                        # 没有视频时才走普通的 agent 逻辑
-                        res = agent.run(prompt)
-                        answer = res.content
-                    
-                    st.markdown(answer)
-                    st.session_state.chat_history.append({"role": "user", "content": prompt})
-                    st.session_state.chat_history.append({"role": "assistant", "content": answer})
-                except Exception as e:
-                    st.error(f"分析失败: {e}")
+    data = request.json
+    user_message = data.get('message', '')
+
+    if not user_message:
+        return jsonify({'error': '消息不能为空'}), 400
+
+    try:
+        # 添加用户消息到历史
+        chat_history.append({'role': 'user', 'content': user_message})
+
+        # 调用 Agent 处理
+        response = agent.run(user_message)
+        assistant_message = response.content
+
+        # 添加助手回复到历史
+        chat_history.append({'role': 'assistant', 'content': assistant_message})
+
+        return jsonify({
+            'success': True,
+            'message': assistant_message,
+            'history': chat_history
+        })
+
+    except Exception as e:
+        error_message = f"❌ 分析过程出错: {str(e)}"
+        chat_history.append({'role': 'assistant', 'content': error_message})
+        return jsonify({'error': error_message}), 500
+
+@app.route('/api/chat-history', methods=['GET'])
+def get_chat_history():
+    """获取聊天历史"""
+    return jsonify({'history': chat_history})
+
+if __name__ == '__main__':
+    # 创建 templates 目录（如果不存在）
+    os.makedirs('templates', exist_ok=True)
+    os.makedirs('static', exist_ok=True)
+
+    print("🚁 低空巡检系统启动中...")
+    print("📍 访问地址: http://localhost:5000")
+    app.run(debug=True, host='0.0.0.0', port=5000)
